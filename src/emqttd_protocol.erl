@@ -14,7 +14,6 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
-%% @doc MQTT Protocol Processor.
 -module(emqttd_protocol).
 
 -include("emqttd.hrl").
@@ -28,14 +27,14 @@
 %% API
 -export([init/3, info/1, clientid/1, client/1, session/1]).
 
--export([received/2, send/2, redeliver/2, shutdown/2]).
+-export([received/2, handle/2, send/2, redeliver/2, shutdown/2]).
 
 -export([process/2]).
 
 %% Protocol State
 -record(proto_state, {peername, sendfun, connected = false,
                       client_id, client_pid, clean_sess,
-                      proto_ver, proto_name, username,
+                      proto_ver, proto_name, username, is_superuser = false,
                       will_msg, keepalive, max_clientid_len = ?MAX_CLIENTID_LEN,
                       session, ws_initial_headers, %% Headers from first HTTP request for websocket client
                       connected_at}).
@@ -116,6 +115,26 @@ received(Packet = ?PACKET(_Type), State) ->
             {error, Reason, State}
     end.
 
+handle({subscribe, RawTopicTable}, ProtoState = #proto_state{client_id = ClientId,
+                                                             username  = Username,
+                                                             session   = Session}) ->
+    TopicTable = parse_topic_table(RawTopicTable),
+    case emqttd:run_hooks('client.subscribe', [ClientId, Username], TopicTable) of
+        {ok, TopicTable1} ->
+            emqttd_session:subscribe(Session, TopicTable1);
+        {stop, _} ->
+            ok
+    end,
+    {ok, ProtoState};
+
+handle({unsubscribe, RawTopics}, ProtoState = #proto_state{client_id = ClientId,
+                                                           username  = Username,
+                                                           session   = Session}) ->
+    {ok, TopicTable} = emqttd:run_hooks('client.unsubscribe',
+                                        [ClientId, Username], parse_topics(RawTopics)),
+    emqttd_session:unsubscribe(Session, TopicTable),
+    {ok, ProtoState}.
+
 process(Packet = ?CONNECT_PACKET(Var), State0) ->
 
     #mqtt_packet_connect{proto_ver  = ProtoVer,
@@ -140,20 +159,20 @@ process(Packet = ?CONNECT_PACKET(Var), State0) ->
     {ReturnCode1, SessPresent, State3} =
     case validate_connect(Var, State1) of
         ?CONNACK_ACCEPT ->
-            case emqttd_access_control:auth(client(State1), Password) of
-                ok ->
+            case authenticate(client(State1), Password) of
+                {ok, IsSuperuser} ->
                     %% Generate clientId if null
                     State2 = maybe_set_clientid(State1),
 
                     %% Start session
-                    case emqttd_sm:start_session(CleanSess, clientid(State2)) of
+                    case emqttd_sm:start_session(CleanSess, {clientid(State2), Username}) of
                         {ok, Session, SP} ->
                             %% Register the client
-                            emqttd_cm:register(client(State2)),
+                            emqttd_cm:reg(client(State2)),
                             %% Start keepalive
                             start_keepalive(KeepAlive),
                             %% ACCEPT
-                            {?CONNACK_ACCEPT, SP, State2#proto_state{session = Session}};
+                            {?CONNACK_ACCEPT, SP, State2#proto_state{session = Session, is_superuser = IsSuperuser}};
                         {error, Error} ->
                             exit({shutdown, Error})
                     end;
@@ -167,14 +186,14 @@ process(Packet = ?CONNECT_PACKET(Var), State0) ->
     %% Run hooks
     emqttd:run_hooks('client.connected', [ReturnCode1], client(State3)),
     %% Send connack
-    send(?CONNACK_PACKET(ReturnCode1, sp(SessPresent)), State3);
+    send(?CONNACK_PACKET(ReturnCode1, sp(SessPresent)), State3),
+    %% stop if authentication failure
+    stop_if_auth_failure(ReturnCode1, State3);
 
-process(Packet = ?PUBLISH_PACKET(_Qos, Topic, _PacketId, _Payload), State) ->
-    case check_acl(publish, Topic, client(State)) of
-        allow ->
-            publish(Packet, State);
-        deny ->
-            ?LOG(error, "Cannot publish to ~s for ACL Deny", [Topic], State)
+process(Packet = ?PUBLISH_PACKET(_Qos, Topic, _PacketId, _Payload), State = #proto_state{is_superuser = IsSuper}) ->
+    case IsSuper orelse allow == check_acl(publish, Topic, client(State)) of
+        true  -> publish(Packet, State);
+        false -> ?LOG(error, "Cannot publish to ~s for ACL Deny", [Topic], State)
     end,
     {ok, State};
 
@@ -197,23 +216,35 @@ process(?PUBACK_PACKET(?PUBCOMP, PacketId), State = #proto_state{session = Sessi
 process(?SUBSCRIBE_PACKET(PacketId, []), State) ->
     send(?SUBACK_PACKET(PacketId, []), State);
 
-process(?SUBSCRIBE_PACKET(PacketId, TopicTable), State = #proto_state{session = Session}) ->
-    Client = client(State),
-    AllowDenies = [check_acl(subscribe, Topic, Client) || {Topic, _Qos} <- TopicTable],
+%% TODO: refactor later...
+process(?SUBSCRIBE_PACKET(PacketId, RawTopicTable), State = #proto_state{session = Session,
+        client_id = ClientId, username = Username, is_superuser = IsSuperuser}) ->
+    Client = client(State), TopicTable = parse_topic_table(RawTopicTable),
+    AllowDenies = if
+                    IsSuperuser -> [];
+                    true -> [check_acl(subscribe, Topic, Client) || {Topic, _Opts} <- TopicTable]
+                  end,
     case lists:member(deny, AllowDenies) of
         true ->
             ?LOG(error, "Cannot SUBSCRIBE ~p for ACL Deny", [TopicTable], State),
             send(?SUBACK_PACKET(PacketId, [16#80 || _ <- TopicTable]), State);
         false ->
-            emqttd_session:subscribe(Session, PacketId, TopicTable), {ok, State}
+            case emqttd:run_hooks('client.subscribe', [ClientId, Username], TopicTable) of
+                {ok, TopicTable1} ->
+                    emqttd_session:subscribe(Session, PacketId, TopicTable1), {ok, State};
+                {stop, _} ->
+                    {ok, State}
+            end
     end;
 
 %% Protect from empty topic list
 process(?UNSUBSCRIBE_PACKET(PacketId, []), State) ->
     send(?UNSUBACK_PACKET(PacketId), State);
 
-process(?UNSUBSCRIBE_PACKET(PacketId, Topics), State = #proto_state{session = Session}) ->
-    emqttd_session:unsubscribe(Session, Topics),
+process(?UNSUBSCRIBE_PACKET(PacketId, RawTopics), State = #proto_state{
+        client_id = ClientId, username = Username, session = Session}) ->
+    {ok, TopicTable} = emqttd:run_hooks('client.unsubscribe', [ClientId, Username], parse_topics(RawTopics)),
+    emqttd_session:unsubscribe(Session, TopicTable),
     send(?UNSUBACK_PACKET(PacketId), State);
 
 process(?PACKET(?PINGREQ), State) ->
@@ -236,8 +267,8 @@ publish(Packet = ?PUBLISH_PACKET(?QOS_2, _PacketId), State) ->
 
 with_puback(Type, Packet = ?PUBLISH_PACKET(_Qos, PacketId),
             State = #proto_state{client_id = ClientId,
-                                 username = Username,
-                                 session = Session}) ->
+                                 username  = Username,
+                                 session   = Session}) ->
     Msg = emqttd_message:from_packet(Username, ClientId, Packet),
     case emqttd_session:publish(Session, Msg) of
         ok ->
@@ -247,19 +278,16 @@ with_puback(Type, Packet = ?PUBLISH_PACKET(_Qos, PacketId),
     end.
 
 -spec(send(mqtt_message() | mqtt_packet(), proto_state()) -> {ok, proto_state()}).
-send(Msg, State = #proto_state{client_id = ClientId})
+send(Msg, State = #proto_state{client_id = ClientId, username = Username})
         when is_record(Msg, mqtt_message) ->
-    emqttd:run_hooks('message.delivered', [ClientId], Msg),
+    emqttd:run_hooks('message.delivered', [ClientId, Username], Msg),
     send(emqttd_message:to_packet(Msg), State);
 
 send(Packet, State = #proto_state{sendfun = SendFun})
     when is_record(Packet, mqtt_packet) ->
     trace(send, Packet, State),
     emqttd_metrics:sent(Packet),
-    Data = emqttd_serializer:serialize(Packet),
-    ?LOG(debug, "SEND ~p", [Data], State),
-    emqttd_metrics:inc('bytes/sent', size(Data)),
-    SendFun(Data),
+    SendFun(Packet),
     {ok, State}.
 
 trace(recv, Packet, ProtoState) ->
@@ -272,20 +300,27 @@ trace(send, Packet, ProtoState) ->
 redeliver({?PUBREL, PacketId}, State) ->
     send(?PUBREL_PACKET(PacketId), State).
 
+stop_if_auth_failure(RC, State) when RC == ?CONNACK_CREDENTIALS; RC == ?CONNACK_AUTH ->
+    {stop, {shutdown, auth_failure}, State};
+
+stop_if_auth_failure(_RC, State) ->
+    {ok, State}.
+
 shutdown(_Error, #proto_state{client_id = undefined}) ->
     ignore;
 
 shutdown(conflict, #proto_state{client_id = _ClientId}) ->
     %% let it down
-    %% emqttd_cm:unregister(ClientId);
+    %% emqttd_cm:unreg(ClientId);
     ignore;
 
-shutdown(Error, State = #proto_state{client_id = ClientId, will_msg = WillMsg}) ->
+shutdown(Error, State = #proto_state{will_msg = WillMsg}) ->
     ?LOG(info, "Shutdown for ~p", [Error], State),
-    send_willmsg(ClientId, WillMsg),
-    emqttd:run_hooks('client.disconnected', [Error], ClientId),
+    Client = client(State),
+    send_willmsg(Client, WillMsg),
+    emqttd:run_hooks('client.disconnected', [Error], Client),
     %% let it down
-    %% emqttd_cm:unregister(ClientId).
+    %% emqttd_cm:unreg(ClientId).
     ok.
 
 willmsg(Packet) when is_record(Packet, mqtt_packet_connect) ->
@@ -301,10 +336,10 @@ maybe_set_clientid(State = #proto_state{client_id = NullId})
 maybe_set_clientid(State) ->
     State.
 
-send_willmsg(_ClientId, undefined) ->
+send_willmsg(_Client, undefined) ->
     ignore;
-send_willmsg(ClientId, WillMsg) ->
-    emqttd:publish(WillMsg#mqtt_message{from = ClientId}).
+send_willmsg(#mqtt_client{client_id = ClientId, username = Username}, WillMsg) ->
+    emqttd:publish(WillMsg#mqtt_message{from = {ClientId, Username}}).
 
 start_keepalive(0) -> ignore;
 
@@ -395,15 +430,34 @@ validate_qos(Qos) when ?IS_QOS(Qos) ->
 validate_qos(_) ->
     false.
 
+parse_topic_table(TopicTable) ->
+    lists:map(fun({Topic0, Qos}) ->
+                {Topic, Opts} = emqttd_topic:parse(Topic0),
+                {Topic, [{qos, Qos}|Opts]}
+        end, TopicTable).
+
+parse_topics(Topics) ->
+    [emqttd_topic:parse(Topic) || Topic <- Topics].
+
+authenticate(Client, Password) ->
+    case emqttd_access_control:auth(Client, Password) of
+        ok             -> {ok, false};
+        {ok, IsSuper}  -> {ok, IsSuper};
+        {error, Error} -> {error, Error}
+    end.
+
 %% PUBLISH ACL is cached in process dictionary.
 check_acl(publish, Topic, Client) ->
-    case get({acl, publish, Topic}) of
-        undefined ->
+    IfCache = emqttd:conf(cache_acl, true),
+    case {IfCache, get({acl, publish, Topic})} of
+        {true, undefined} ->
             AllowDeny = emqttd_access_control:check_acl(Client, publish, Topic),
             put({acl, publish, Topic}, AllowDeny),
             AllowDeny;
-        AllowDeny ->
-            AllowDeny
+        {true, AllowDeny} ->
+            AllowDeny;
+        {false, _} ->
+            emqttd_access_control:check_acl(Client, publish, Topic)
     end;
 
 check_acl(subscribe, Topic, Client) ->
@@ -411,4 +465,3 @@ check_acl(subscribe, Topic, Client) ->
 
 sp(true)  -> 1;
 sp(false) -> 0.
-

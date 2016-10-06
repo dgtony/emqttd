@@ -14,7 +14,6 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
-%% @doc emqttd presence management module
 -module(emqttd_mod_presence).
 
 -behaviour(emqttd_gen_mod).
@@ -45,12 +44,13 @@ on_client_connected(ConnAck, Client = #mqtt_client{client_id  = ClientId,
     emqttd:publish(emqttd_message:set_flag(sys, Msg)),
     {ok, Client}.
 
-on_client_disconnected(Reason, ClientId, Opts) ->
+on_client_disconnected(Reason, #mqtt_client{client_id = ClientId}, Opts) ->
     Json = mochijson2:encode([{clientid, ClientId},
                               {reason, reason(Reason)},
                               {ts, emqttd_time:now_to_secs()}]),
     Msg = message(qos(Opts), topic(disconnected, ClientId), Json),
-    emqttd:publish(emqttd_message:set_flag(sys, Msg)).
+    emqttd:publish(emqttd_message:set_flag(sys, Msg)),
+    ok.
 
 unload(_Opts) ->
     emqttd:unhook('client.connected', fun ?MODULE:on_client_connected/3),

@@ -66,17 +66,20 @@ init([MqttEnv, WsPid, Req, ReplyChannel]) ->
     {ok, Peername} = Req:get(peername),
     Headers = mochiweb_headers:to_list(
                 mochiweb_request:get(headers, Req)),
-    PktOpts = proplists:get_value(packet, MqttEnv),
-    SendFun = fun(Payload) -> ReplyChannel({binary, Payload}) end,
+    %% SendFun = fun(Payload) -> ReplyChannel({binary, Payload}) end,
+    SendFun = fun(Packet) ->
+                  Data = emqttd_serializer:serialize(Packet),
+                  emqttd_metrics:inc('bytes/sent', size(Data)),
+                  ReplyChannel({binary, Data})
+              end,
     ProtoState = emqttd_protocol:init(Peername, SendFun,
-                                      [{ws_initial_headers, Headers} | PktOpts]),
+                                      [{ws_initial_headers, Headers} | MqttEnv]),
     {ok, #wsclient_state{ws_pid = WsPid, peer = Req:get(peer),
                          connection = Req:get(connection),
                          proto_state = ProtoState}, idle_timeout(MqttEnv)}.
 
 idle_timeout(MqttEnv) ->
-    ClientOpts = proplists:get_value(client, MqttEnv),
-    timer:seconds(proplists:get_value(idle_timeout, ClientOpts, 10)).
+    timer:seconds(proplists:get_value(client_idle_timeout, MqttEnv, 10)).
 
 handle_call(session, _From, State = #wsclient_state{proto_state = ProtoState}) ->
     {reply, emqttd_protocol:session(ProtoState), State};
@@ -94,14 +97,14 @@ handle_call(Req, _From, State = #wsclient_state{peer = Peer}) ->
     {reply, {error, unsupported_request}, State}.
 
 handle_cast({subscribe, TopicTable}, State) ->
-    with_session(fun(SessPid) ->
-                   emqttd_session:subscribe(SessPid, TopicTable)
-                 end, State);
+    with_proto_state(fun(ProtoState) ->
+                emqttd_protocol:handle({subscribe, TopicTable}, ProtoState)
+        end, State);
 
 handle_cast({unsubscribe, Topics}, State) ->
-    with_session(fun(SessPid) ->
-                   emqttd_session:unsubscribe(SessPid, Topics)
-                 end, State);
+    with_proto_state(fun(ProtoState) ->
+                emqttd_protocol:handle({unsubscribe, Topics}, ProtoState)
+        end, State);
 
 handle_cast({received, Packet}, State = #wsclient_state{peer = Peer, proto_state = ProtoState}) ->
     case emqttd_protocol:received(Packet, ProtoState) of
@@ -190,9 +193,6 @@ code_change(_OldVsn, State, _Extra) ->
 with_proto_state(Fun, State = #wsclient_state{proto_state = ProtoState}) ->
     {ok, ProtoState1} = Fun(ProtoState),
     noreply(State#wsclient_state{proto_state = ProtoState1}).
-
-with_session(Fun, State = #wsclient_state{proto_state = ProtoState}) ->
-    Fun(emqttd_protocol:session(ProtoState)), noreply(State).
 
 noreply(State) ->
     {noreply, State, hibernate}.

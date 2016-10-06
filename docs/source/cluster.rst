@@ -161,7 +161,7 @@ Suppose we deploy two nodes cluster on s1.emqtt.io, s2.emqtt.io:
 emqttd@s1.emqtt.io setting
 --------------------------
 
-emqttd/etc/vm.args::
+emqttd/releases/2.0/vm.args::
 
     -name emqttd@s1.emqtt.io
 
@@ -174,7 +174,7 @@ emqttd/etc/vm.args::
 emqttd@s2.emqtt.io setting
 --------------------------
 
-emqttd/etc/vm.args::
+emqttd/releases/2.0/vm.args::
 
     -name emqttd@s2.emqtt.io
 
@@ -245,7 +245,7 @@ The Firewall
 
 If there is a firewall between clustered nodes, the cluster requires to open 4369 port used by epmd daemon, and a port segment for nodes' communication.
 
-Configure the port segment in etc/emqttd.config, for example:
+Configure the port segment in releases/2.0/sys.config, for example:
 
 .. code-block:: erlang
 

@@ -7,8 +7,6 @@ deps
 erl_crash.dump
 ebin
 !ebin/.placeholder
-rel/emqttd
-rel/emqttd*
 .concrete/DEV_MODE
 .rebar
 test/ebin/*.beam
@@ -27,3 +25,6 @@ test/ct.cover.spec
 logs
 ct.coverdata
 .DS*
+.idea/
+emqttd.iml
+_rel/

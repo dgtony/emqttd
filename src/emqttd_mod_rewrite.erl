@@ -14,7 +14,6 @@
 %% limitations under the License.
 %%--------------------------------------------------------------------
 
-%% @doc emqttd rewrite module
 -module(emqttd_mod_rewrite).
 
 -behaviour(emqttd_gen_mod).
@@ -23,27 +22,30 @@
 
 -export([load/1, reload/1, unload/1]).
 
--export([rewrite_subscribe/3, rewrite_unsubscribe/3, rewrite_publish/2]).
+-export([rewrite_subscribe/4, rewrite_unsubscribe/4, rewrite_publish/2]).
 
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
 
 load(Opts) ->
-    File = proplists:get_value(file, Opts),
-    {ok, Terms} = file:consult(File),
-    Sections = compile(Terms),
-    emqttd:hook('client.subscribe', fun ?MODULE:rewrite_subscribe/3, [Sections]),
-    emqttd:hook('client.unsubscribe', fun ?MODULE:rewrite_unsubscribe/3, [Sections]),
-    emqttd:hook('message.publish', fun ?MODULE:rewrite_publish/2, [Sections]).
+    case proplists:get_value(config, Opts) of
+        undefined ->
+            ok;
+        File ->
+            {ok, Terms} = file:consult(File), Sections = compile(Terms),
+            emqttd:hook('client.subscribe', fun ?MODULE:rewrite_subscribe/4, [Sections]),
+            emqttd:hook('client.unsubscribe', fun ?MODULE:rewrite_unsubscribe/4, [Sections]),
+            emqttd:hook('message.publish', fun ?MODULE:rewrite_publish/2, [Sections])
+    end.
 
-rewrite_subscribe(_ClientId, TopicTable, Sections) ->
+rewrite_subscribe(_ClientId, _Username, TopicTable, Sections) ->
     lager:info("Rewrite subscribe: ~p", [TopicTable]),
-    {ok, [{match_topic(Topic, Sections), Qos} || {Topic, Qos} <- TopicTable]}.
+    {ok, [{match_topic(Topic, Sections), Opts} || {Topic, Opts} <- TopicTable]}.
 
-rewrite_unsubscribe(_ClientId, Topics, Sections) ->
-    lager:info("Rewrite unsubscribe: ~p", [Topics]),
-    {ok, [match_topic(Topic, Sections) || Topic <- Topics]}.
+rewrite_unsubscribe(_ClientId, _Username, TopicTable, Sections) ->
+    lager:info("Rewrite unsubscribe: ~p", [TopicTable]),
+    {ok, [{match_topic(Topic, Sections), Opts} || {Topic, Opts} <- TopicTable]}.
 
 rewrite_publish(Message=#mqtt_message{topic = Topic}, Sections) ->
     %%TODO: this will not work if the client is always online.
@@ -68,8 +70,8 @@ reload(File) ->
     end.
             
 unload(_) ->
-    emqttd:unhook('client.subscribe',  fun ?MODULE:rewrite_subscribe/3),
-    emqttd:unhook('client.unsubscribe',fun ?MODULE:rewrite_unsubscribe/3),
+    emqttd:unhook('client.subscribe',  fun ?MODULE:rewrite_subscribe/4),
+    emqttd:unhook('client.unsubscribe',fun ?MODULE:rewrite_unsubscribe/4),
     emqttd:unhook('message.publish',   fun ?MODULE:rewrite_publish/2).
 
 %%--------------------------------------------------------------------

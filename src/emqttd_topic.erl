@@ -16,19 +16,27 @@
 
 -module(emqttd_topic).
 
+-include("emqttd_protocol.hrl").
+
+-import(lists, [reverse/1]).
+
 -export([match/2, validate/1, triples/1, words/1, wildcard/1]).
 
--export([join/1, feed_var/3, is_queue/1, systop/1]).
+-export([join/1, feed_var/3, systop/1]).
 
--type topic() :: binary().
+-export([parse/1, parse/2]).
 
--type word()   :: '' | '+' | '#' | '?' | binary().
+-type(topic() :: binary()).
 
--type words()  :: list(word()).
+-type(option() :: local | {qos, mqtt_qos()} | {share, '$queue' | binary()}).
 
--type triple() :: {root | binary(), word(), binary()}.
+-type(word()   :: '' | '+' | '#' | '?' | binary()).
 
--export_type([topic/0, word/0, triple/0]).
+-type(words()  :: list(word())).
+
+-type(triple() :: {root | binary(), word(), binary()}).
+
+-export_type([topic/0, option/0, word/0, triple/0]).
 
 -define(MAX_TOPIC_LEN, 4096).
 
@@ -119,7 +127,7 @@ triples(Topic) when is_binary(Topic) ->
     triples(words(Topic), root, []).
 
 triples([], _Parent, Acc) ->
-    lists:reverse(Acc);
+    reverse(Acc);
 
 triples([W|Words], Parent, Acc) ->
     Node = join(Parent, W),
@@ -147,13 +155,6 @@ word(<<"?">>) -> '?';
 word(<<"#">>) -> '#';
 word(Bin)     -> Bin.
 
-%% @doc Queue is a special topic name that starts with "$queue/"
--spec(is_queue(topic()) -> boolean()).
-is_queue(<<"$queue/", _Queue/binary>>) ->
-    true;
-is_queue(_) ->
-    false.
-
 %% @doc '$SYS' Topic.
 systop(Name) when is_atom(Name) ->
     list_to_binary(lists:concat(["$SYS/brokers/", node(), "/", Name]));
@@ -165,7 +166,7 @@ systop(Name) when is_binary(Name) ->
 feed_var(Var, Val, Topic) ->
     feed_var(Var, Val, words(Topic), []).
 feed_var(_Var, _Val, [], Acc) ->
-    join(lists:reverse(Acc));
+    join(reverse(Acc));
 feed_var(Var, Val, [Var|Words], Acc) ->
     feed_var(Var, Val, Words, [Val|Acc]);
 feed_var(Var, Val, [W|Words], Acc) ->
@@ -184,4 +185,29 @@ join(Words) ->
                         {false, <<W/binary, "/", Tail/binary>>}
                 end, {true, <<>>}, [bin(W) || W <- Words]),
     Bin.
+
+-spec(parse(topic()) -> {topic(), [option()]}).
+parse(Topic) when is_binary(Topic) ->
+    parse(Topic, []).
+
+parse(Topic = <<"$local/", Topic1/binary>>, Options) ->
+    case lists:member(local, Options) of
+        true  -> error({invalid_topic, Topic});
+        false -> parse(Topic1, [local | Options])
+    end;
+
+parse(Topic = <<"$queue/", Topic1/binary>>, Options) ->
+    case lists:keyfind(share, 1, Options) of
+        {share, _} -> error({invalid_topic, Topic});
+        false      -> parse(Topic1, [{share, '$queue'} | Options])
+    end;
+
+parse(Topic = <<"$share/", Topic1/binary>>, Options) ->
+    case lists:keyfind(share, 1, Options) of
+        {share, _} -> error({invalid_topic, Topic});
+        false      -> [Share, Topic2] = binary:split(Topic1, <<"/">>),
+                      {Topic2, [{share, Share} | Options]}
+    end;
+
+parse(Topic, Options) -> {Topic, Options}.
 

@@ -38,8 +38,33 @@ groups() ->
       [compile_rule,
        match_rule]}].
 
+init_per_group(access_control, Config) ->
+    application:load(emqttd),
+    prepare_config(),
+    gen_conf:init(emqttd),
+    Config;
+
 init_per_group(_Group, Config) ->
     Config.
+
+prepare_config() ->
+    Rules = [{allow, {ipaddr, "127.0.0.1"}, subscribe, ["$SYS/#", "#"]},
+             {allow, {user, "testuser"}, subscribe, ["a/b/c", "d/e/f/#"]},
+             {allow, {user, "admin"}, pubsub, ["a/b/c", "d/e/f/#"]},
+             {allow, {client, "testClient"}, subscribe, ["testTopics/testClient"]},
+             {allow, all, subscribe, ["clients/%c"]},
+             {allow, all, pubsub, ["users/%u/#"]},
+             {deny, all, subscribe, ["$SYS/#", "#"]},
+             {deny, all}],
+    write_config("access_SUITE_acl.conf", Rules),
+    Config = [{auth, anonymous, []},
+              {acl, internal, [{config, "access_SUITE_acl.conf"},
+                               {nomatch, allow}]}],
+    write_config("access_SUITE_emqttd.conf", Config),
+    application:set_env(emqttd, conf, "access_SUITE_emqttd.conf").
+
+write_config(Filename, Terms) ->
+    file:write_file(Filename, [io_lib:format("~tp.~n", [Term]) || Term <- Terms]).
 
 end_per_group(_Group, Config) ->
     Config.
@@ -48,14 +73,7 @@ init_per_testcase(TestCase, Config) when TestCase =:= reload_acl;
                                          TestCase =:= register_mod;
                                          TestCase =:= unregister_mod;
                                          TestCase =:= check_acl ->
-    DataDir = proplists:get_value(data_dir, Config),
-    AclOpts = [
-        {auth, [{anonymous, []}]},
-        {acl,  [{internal, [{file, filename:join([DataDir, "test_acl.config"])},
-                            {nomatch, allow}]}]}
-    ],
-    {ok, _Pid} = ?AC:start_link(AclOpts),
-    Config;
+    {ok, _Pid} = ?AC:start_link(), Config;
 
 init_per_testcase(_TestCase, Config) ->
     Config.
@@ -133,10 +151,10 @@ compile_rule(_) ->
         compile({allow, {user, "admin"}, pubsub, ["d/e/f/#"]}),
     {allow, {client, <<"testClient">>}, publish, [ [<<"testTopics">>, <<"testClient">>] ]} =
         compile({allow, {client, "testClient"}, publish, ["testTopics/testClient"]}),
-    {allow, all, pubsub, [{pattern, [<<"clients">>, <<"$c">>]}]} =
-        compile({allow, all, pubsub, ["clients/$c"]}),
-    {allow, all, subscribe, [{pattern, [<<"users">>, <<"$u">>, '#']}]} =
-        compile({allow, all, subscribe, ["users/$u/#"]}),
+    {allow, all, pubsub, [{pattern, [<<"clients">>, <<"%c">>]}]} =
+        compile({allow, all, pubsub, ["clients/%c"]}),
+    {allow, all, subscribe, [{pattern, [<<"users">>, <<"%u">>, '#']}]} =
+        compile({allow, all, subscribe, ["users/%u/#"]}),
     {deny, all, subscribe, [ [<<"$SYS">>, '#'], ['#'] ]} =
         compile({deny, all, subscribe, ["$SYS/#", "#"]}),
     {allow, all} = compile({allow, all}),
@@ -153,9 +171,9 @@ match_rule(_) ->
     {matched, allow} = match(User, <<"d/e/f/x">>, compile({allow, {user, "TestUser"}, subscribe, ["a/b/c", "d/e/f/#"]})),
     nomatch = match(User, <<"d/e/f/x">>, compile({allow, {user, "admin"}, pubsub, ["d/e/f/#"]})),
     {matched, allow} = match(User, <<"testTopics/testClient">>, compile({allow, {client, "testClient"}, publish, ["testTopics/testClient"]})),
-    {matched, allow} = match(User, <<"clients/testClient">>, compile({allow, all, pubsub, ["clients/$c"]})),
+    {matched, allow} = match(User, <<"clients/testClient">>, compile({allow, all, pubsub, ["clients/%c"]})),
     {matched, allow} = match(#mqtt_client{username = <<"user2">>}, <<"users/user2/abc/def">>,
-                             compile({allow, all, subscribe, ["users/$u/#"]})),
+                             compile({allow, all, subscribe, ["users/%u/#"]})),
     {matched, deny} = match(User, <<"d/e/f">>, compile({deny, all, subscribe, ["$SYS/#", "#"]})),
     Rule = compile({allow, {'and', [{ipaddr, "127.0.0.1"}, {user, <<"WrongUser">>}]}, publish, <<"Topic">>}),
     nomatch = match(User, <<"Topic">>, Rule),
